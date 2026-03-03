@@ -171,7 +171,10 @@ void LCDprint(xdata char *s, unsigned char line)
 	LCD_cmd(line==2?0xC0:0x80);
 	for(i=0;i<16;i++)
 	{
-		if(s[i]==0) break;
+		if(s[i]==0) {
+			MISMATCH_LED = 1;
+			break;
+		}
 		LCD_data(s[i]);
 	}
 	for(;i<16;i++) LCD_data(' ');
