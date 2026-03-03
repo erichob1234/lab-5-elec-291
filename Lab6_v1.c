@@ -172,7 +172,6 @@ void LCDprint(xdata char *s, unsigned char line)
 	for(i=0;i<16;i++)
 	{
 		if(s[i]==0) {
-			MISMATCH_LED = 1;
 			break;
 		}
 		LCD_data(s[i]);
@@ -407,6 +406,14 @@ void main(void)
 	InitPinADC(2,6);
 	InitADC();
 	LCD_init();
+	
+	clear_line(line1);
+
+	put_str(line1,0,"BOOT OK");
+
+	LCDprint(line1,1);
+
+	while(1);
 
 	while(1)
 	{
