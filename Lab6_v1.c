@@ -1,5 +1,6 @@
-// ===================== FINAL: MODE0 + MODE1 + MODE2(POWER) + EDGE-SAFE =====================
-// Keil C51 (C90) friendly, avoids DATA overflow by placing large variables in XDATA.
+// ===================== NON-BLOCKING INSTRUMENT VERSION =====================
+// Fixes the “blank LCD / stuck in while() waits” by eliminating ALL blocking
+// edge-waits. Uses a free-running Timer0 timestamp + edge-detect state machines.
 //
 // Modes:
 // 0: V/I RMS + Phase
@@ -12,19 +13,23 @@
 //   P0.2 = TEST square wave
 //   P2.6 = REF analog (Voltage)
 //   P2.5 = TEST analog (Current sensor output scaled to "mA as mV")
-//   P2.2 = Button (active-low) toggles modes
+//   P2.2 = Button (active-low), hold ~1–2s ok
 //   P2.1 = LED (active-high): ON when frequency mismatch
 //
 // Notes:
-// - No printf/sprintf, no float.
-// - Power uses small-angle approx (best when |phase| not huge):
-//     sin(phi) ˜ phi, cos(phi) ˜ 1 - phi^2/2, phi in radians (Q15)
-// - Frequency mismatch uses hysteresis to prevent flicker.
+// - No blocking while(pin...) anywhere.
+// - Timer0 runs free, ISR extends to 32-bit timebase.
+// - Rising edges detected by sampling pin each loop.
+// - Periods from consecutive rising edge timestamps.
+// - Phase from most recent REF and TEST rising edges (wrap to [-T/2, +T/2]).
+//   Sign convention matches your earlier code: TEST lag => negative phase.
+// - RMS sampled at (edge + T/4) using a scheduled timestamp (no wait loops).
+// - Frequency mismatch LED uses hysteresis (same idea as before).
 
 #include <EFM8LB1.h>
 
-#define SYSCLK 72000000L
-#define SARCLK 18000000L
+#define SYSCLK  72000000L
+#define SARCLK  18000000L
 
 // LCD pins
 #define LCD_RS P1_7
@@ -46,34 +51,58 @@
 #define VDD_UV 3303500UL
 #define ADC_FS 16383UL
 
-// Fixed-point constants
+// Fixed-point
 #define RMS_NUM 7071UL
 #define RMS_DEN 10000UL
 
+// Timer0 tick rate in Mode1 on this setup: SYSCLK/12
+#define T0_TICKS_PER_SEC (SYSCLK/12UL)
+
 // ===== Small DATA (keep tiny) =====
-unsigned char overflow_count;
+unsigned char overflow_count;   // kept for compatibility (not used for period now)
 unsigned char mode = 0;
 bit last_btn = 1;
 bit mismatch = 0;
 
-// ===== XDATA: large variables (avoid DATA overflow) =====
+// ===== 32-bit free-running timebase =====
+volatile xdata unsigned long t0_hi = 0;  // increments every Timer0 overflow (65536 ticks)
+
+// ===== Measurement state (xdata to avoid DATA overflow) =====
+xdata unsigned long t_ref_last;
+xdata unsigned long t_ref_prev;
+xdata unsigned long t_test_last;
+xdata unsigned long t_test_prev;
+
 xdata unsigned long period_ref;
 xdata unsigned long period_test;
-xdata unsigned long dticks;
-xdata unsigned long amp_ticks;
+
+xdata bit ref_valid;
+xdata bit test_valid;
+
+// Edge detect previous pin states
+xdata bit ref_prev_state;
+xdata bit test_prev_state;
+
+// Scheduled RMS sampling
+xdata unsigned long ref_sample_time;
+xdata unsigned long test_sample_time;
+xdata bit ref_sample_pending;
+xdata bit test_sample_pending;
 
 xdata unsigned int ref_amp_mV;
 xdata unsigned int test_amp_mV;
 xdata unsigned int ref_rms_mV;
 xdata unsigned int test_rms_mV;
 
+// Phase in centi-degrees
 xdata long phase_cdeg;
 
+// Gain/dB
 xdata unsigned long gain_x10000;
 xdata unsigned long ratio_q16_16;
 xdata long db_centi;
 
-// Power temporaries
+// Power
 xdata long VI_mW;
 xdata long phi_rad_q15;
 xdata long sinphi_q15;
@@ -104,33 +133,76 @@ char _c51_external_startup(void)
 	CLKSEL=0x00; CLKSEL=0x00; while(!(CLKSEL&0x80));
 	CLKSEL=0x03; CLKSEL=0x03; while(!(CLKSEL&0x80));
 
-	XBR2=0x40;
+	XBR2=0x40; // crossbar + weak pullups
 
-	// Make P0.1 / P0.2 digital
+	// Ensure P0.1/P0.2 are digital inputs
 	SFRPAGE=0x20;
-	P0MDIN |= 0x06; // bits 1 and 2
+	P0MDIN |= 0x06; // P0.1, P0.2 digital
 	SFRPAGE=0x00;
 
 	return 0;
 }
 
-// ===================== TIMER0 =====================
-void TIMER0_Init(void)
+// ===================== TIMER0 FREE-RUNNING + ISR =====================
+void TIMER0_Init_FreeRun(void)
 {
+	// Timer0 Mode 1, 16-bit
 	TMOD &= 0xF0;
-	TMOD |= 0x01; // 16-bit timer
-	TR0=0;
+	TMOD |= 0x01;
+
+	TR0 = 0;
+	TL0 = 0;
+	TH0 = 0;
+	TF0 = 0;
+
+	ET0 = 1;  // enable Timer0 interrupt
+	EA  = 1;  // global enable
+
+	TR0 = 1;  // start free-running
 }
 
-// ===================== TIMER3 delay =====================
+// Timer0 overflow ISR: extend to 32-bit time
+void Timer0_ISR(void) interrupt 1
+{
+	TF0 = 0;
+	t0_hi++;
+}
+
+// Atomic read of 32-bit timestamp = (t0_hi<<16) | (TH0:TL0)
+unsigned long time_now_ticks(void)
+{
+	unsigned long hi1, hi2;
+	unsigned char th, tl;
+	unsigned long t;
+
+	EA = 0;
+	hi1 = t0_hi;
+	th  = TH0;
+	tl  = TL0;
+	hi2 = t0_hi;
+	EA = 1;
+
+	// If overflow happened during read, re-read quickly
+	if(hi2 != hi1)
+	{
+		EA = 0;
+		hi1 = t0_hi;
+		th  = TH0;
+		tl  = TL0;
+		EA = 1;
+	}
+
+	t = (hi1<<16) | ((unsigned long)th<<8) | tl;
+	return t;
+}
+
+// ===================== TIMER3 delay (LCD) =====================
 void Timer3us(unsigned char us)
 {
 	unsigned char i;
-
-	CKCON0 |= 0x40; // Timer3 uses SYSCLK
+	CKCON0 |= 0x40;
 	TMR3RL = -(SYSCLK/1000000L);
 	TMR3   = TMR3RL;
-
 	TMR3CN0 = 0x04;
 	for(i=0;i<us;i++)
 	{
@@ -144,12 +216,11 @@ void waitms(unsigned int ms)
 {
 	unsigned int j;
 	unsigned char k;
-
 	for(j=0;j<ms;j++)
 		for(k=0;k<4;k++) Timer3us(250);
 }
 
-// ===================== LCD (4-bit HD44780) =====================
+// ===================== LCD =====================
 void LCD_pulse(void){ LCD_E=1; Timer3us(40); LCD_E=0; }
 
 void LCD_byte(unsigned char x)
@@ -157,7 +228,6 @@ void LCD_byte(unsigned char x)
 	ACC=x;
 	LCD_D7=ACC_7; LCD_D6=ACC_6; LCD_D5=ACC_5; LCD_D4=ACC_4;
 	LCD_pulse(); Timer3us(40);
-
 	ACC=x;
 	LCD_D7=ACC_3; LCD_D6=ACC_2; LCD_D5=ACC_1; LCD_D4=ACC_0;
 	LCD_pulse();
@@ -170,14 +240,8 @@ void LCD_init(void)
 {
 	LCD_E=0;
 	waitms(20);
-
-	LCD_cmd(0x33);
-	LCD_cmd(0x33);
-	LCD_cmd(0x32);
-
-	LCD_cmd(0x28);
-	LCD_cmd(0x0C);
-	LCD_cmd(0x01);
+	LCD_cmd(0x33); LCD_cmd(0x33); LCD_cmd(0x32);
+	LCD_cmd(0x28); LCD_cmd(0x0C); LCD_cmd(0x01);
 	waitms(20);
 }
 
@@ -185,7 +249,6 @@ void LCDprint(xdata char *s, unsigned char line)
 {
 	unsigned char i;
 	LCD_cmd(line==2?0xC0:0x80);
-
 	for(i=0;i<16;i++)
 	{
 		if(s[i]==0) break;
@@ -199,16 +262,14 @@ void InitADC(void)
 {
 	ADEN=0;
 	ADC0CN1=(0x2<<6);                 // 14-bit
-	ADC0CF0=((SYSCLK/SARCLK)<<3);     // SAR clock divider
+	ADC0CF0=((SYSCLK/SARCLK)<<3);
 	ADC0CF2=(0x1<<5)|(0x1F);          // VDD ref
 	ADEN=1;
 }
 
 void InitPinADC(unsigned char portno,unsigned char pinno)
 {
-	unsigned char mask;
-
-	mask = 1<<pinno;
+	unsigned char mask = 1<<pinno;
 	SFRPAGE=0x20;
 	if(portno==2)
 	{
@@ -231,51 +292,12 @@ unsigned int mV_read(unsigned char pin)
 {
 	unsigned long adc;
 	unsigned long uv;
-
 	adc = ADC_read(pin);
 	uv  = (adc*VDD_UV)/ADC_FS;
 	return (unsigned int)((uv+500)/1000);
 }
 
-// ===================== Edge-safe period =====================
-unsigned long measure_period(bit pin)
-{
-	unsigned long ticks;
-
-	TL0=0; TH0=0; TF0=0; overflow_count=0;
-
-	// Rising-edge sync, safe regardless of initial state
-	while(pin==1);
-	while(pin==0);
-
-	TR0=1;
-
-	// Measure HIGH then LOW => one full period
-	while(pin==1) { if(TF0){TF0=0; overflow_count++;} }
-	while(pin==0) { if(TF0){TF0=0; overflow_count++;} }
-
-	TR0=0;
-
-	ticks = ((unsigned long)overflow_count<<16)
-	      | ((unsigned long)TH0<<8)
-	      | TL0;
-
-	return ticks;
-}
-
-// ===================== Phase helpers =====================
-long phase_calc(unsigned long dt, unsigned long T)
-{
-	unsigned long t360;
-	unsigned long deg;
-	unsigned long rem;
-
-	t360 = dt*360UL;
-	deg  = t360/T;
-	rem  = t360%T;
-	return (long)(deg*100UL + (rem*100UL)/T); // centi-deg
-}
-
+// ===================== MATH HELPERS =====================
 long wrap_phase(long p)
 {
 	while(p>18000L) p-=36000L;
@@ -283,7 +305,24 @@ long wrap_phase(long p)
 	return p;
 }
 
-// ===================== dB helpers (approx) =====================
+// dt/T -> centi-deg
+long phase_from_dt(unsigned long dt, unsigned long T)
+{
+	unsigned long t360, deg, rem;
+	if(T==0) return 0;
+	t360 = dt*360UL;
+	deg  = t360/T;
+	rem  = t360%T;
+	return (long)(deg*100UL + (rem*100UL)/T);
+}
+
+// Q15 radians from centi-deg, (pi/180)*32768 ˜ 572
+long phase_to_rad_q15(long cdeg)
+{
+	return (cdeg * 572L) / 100L;
+}
+
+// dB helpers (approx) same as earlier
 int log2_q8_8(unsigned long m)
 {
 	int e;
@@ -304,19 +343,19 @@ int log2_q8_8(unsigned long m)
 
 	ln = (long)u - (long)(u2>>1) + (long)(u3/3UL);
 
-	frac  = (ln*94548L)>>16;          // ln2 scaling approx
-	total = ((long)e<<16) + frac;     // Q16.16
-	return (int)(total>>8);           // Q8.8
+	frac  = (ln*94548L)>>16;
+	total = ((long)e<<16) + frac;
+	return (int)(total>>8);
 }
 
 long db_centi_from_ratio_q16_16(unsigned long r)
 {
 	int l2;
 	l2 = log2_q8_8(r);
-	return ((long)l2*60206L)/256L;    // 20*log10(2)=6.0206 dB
+	return ((long)l2*60206L)/256L;
 }
 
-// ===================== Display helpers =====================
+// ===================== DISPLAY HELPERS =====================
 void clear_line(xdata char *s)
 {
 	unsigned char i;
@@ -326,22 +365,18 @@ void clear_line(xdata char *s)
 void put_char(xdata char *s, unsigned char p, char c){ if(p<16) s[p]=c; }
 void put_str(xdata char *s, unsigned char p, const char *t){ while(*t && p<16) s[p++]=*t++; }
 
-// mV -> "d.dd" (4 chars). Good for 0.00–9.99V (your lab range)
 void put_mV(xdata char *s, unsigned char p, unsigned int mv)
 {
 	unsigned int v;
 	unsigned int f;
-
 	v = mv/1000;
 	f = (mv%1000)/10;
-
 	put_char(s,p+0,'0'+(v%10));
 	put_char(s,p+1,'.');
 	put_char(s,p+2,'0'+(f/10));
 	put_char(s,p+3,'0'+(f%10));
 }
 
-// Signed centi-units -> "+ddd.dd" (7 chars)
 void put_centi_signed(xdata char *s, unsigned char p, long value_centi)
 {
 	char sign;
@@ -365,12 +400,10 @@ void put_centi_signed(xdata char *s, unsigned char p, long value_centi)
 	put_char(s,p+6,'0'+(f%10));
 }
 
-// gain_x10000 -> "d.dddd" (6 chars)
 void put_gain(xdata char *s, unsigned char p, unsigned long g)
 {
 	unsigned int i;
 	unsigned int f;
-
 	i = (unsigned int)(g/10000UL);
 	f = (unsigned int)(g%10000UL);
 
@@ -382,7 +415,6 @@ void put_gain(xdata char *s, unsigned char p, unsigned long g)
 	put_char(s,p+5,'0'+(f%10));
 }
 
-// centi-dB -> "+dd.dd" (6 chars)
 void put_db(xdata char *s, unsigned char p, long cdb)
 {
 	char sign;
@@ -405,20 +437,148 @@ void put_db(xdata char *s, unsigned char p, long cdb)
 	put_char(s,p+5,'0'+(f%10));
 }
 
-// ===================== Power helpers =====================
-// centi-deg -> radians Q15; (pi/180)*32768 ˜ 572
-long phase_to_rad_q15(long cdeg)
+// ===================== EDGE + SCHEDULER UPDATE =====================
+void update_edges_and_schedule(void)
 {
-	return (cdeg * 572L) / 100L;
+	unsigned long t;
+	bit r, s;
+
+	t = time_now_ticks();
+
+	// REF edge detect
+	r = REF_SQ;
+	if((ref_prev_state==0) && (r==1))
+	{
+		// rising edge
+		t_ref_prev = t_ref_last;
+		t_ref_last = t;
+
+		if(t_ref_prev != 0)
+		{
+			period_ref = t_ref_last - t_ref_prev;
+			ref_valid = 1;
+
+			// schedule RMS sample at T/4 after edge
+			ref_sample_time = t_ref_last + (period_ref>>2);
+			ref_sample_pending = 1;
+		}
+	}
+	ref_prev_state = r;
+
+	// TEST edge detect
+	s = TEST_SQ;
+	if((test_prev_state==0) && (s==1))
+	{
+		t_test_prev = t_test_last;
+		t_test_last = t;
+
+		if(t_test_prev != 0)
+		{
+			period_test = t_test_last - t_test_prev;
+			test_valid = 1;
+
+			test_sample_time = t_test_last + (period_test>>2);
+			test_sample_pending = 1;
+		}
+	}
+	test_prev_state = s;
+}
+
+// Non-blocking RMS sampling when scheduled time has passed
+void update_rms_samples(void)
+{
+	unsigned long t;
+	t = time_now_ticks();
+
+	if(ref_sample_pending && ref_valid)
+	{
+		if((long)(t - ref_sample_time) >= 0)
+		{
+			ref_amp_mV = mV_read(QFP32_MUX_P2_6);
+			ref_rms_mV = (unsigned int)(((unsigned long)ref_amp_mV*RMS_NUM)/RMS_DEN);
+			ref_sample_pending = 0;
+		}
+	}
+
+	if(test_sample_pending && test_valid)
+	{
+		if((long)(t - test_sample_time) >= 0)
+		{
+			test_amp_mV = mV_read(QFP32_MUX_P2_5);
+			test_rms_mV = (unsigned int)(((unsigned long)test_amp_mV*RMS_NUM)/RMS_DEN);
+			test_sample_pending = 0;
+		}
+	}
+}
+
+// Compute phase non-blocking using latest timestamps
+void update_phase(void)
+{
+	unsigned long dt;
+	long dt_signed;
+
+	if(!ref_valid || !test_valid) { phase_cdeg = 0; return; }
+	if(period_ref == 0) { phase_cdeg = 0; return; }
+
+	// dt = test - ref (signed)
+	dt_signed = (long)(t_test_last - t_ref_last);
+
+	// wrap dt into [-T/2, +T/2] in ticks
+	if(dt_signed > (long)(period_ref>>1))  dt_signed -= (long)period_ref;
+	if(dt_signed < -(long)(period_ref>>1)) dt_signed += (long)period_ref;
+
+	// Convert to centi-deg. Sign convention: TEST lags => negative phase.
+	// If TEST happens after REF, dt_signed > 0, that is a lag, so phase should be negative.
+	if(dt_signed >= 0)
+	{
+		dt = (unsigned long)dt_signed;
+		phase_cdeg = -phase_from_dt(dt, period_ref);
+	}
+	else
+	{
+		dt = (unsigned long)(-dt_signed);
+		phase_cdeg = phase_from_dt(dt, period_ref);
+	}
+
+	phase_cdeg = wrap_phase(phase_cdeg);
+}
+
+// Mismatch LED with hysteresis (only if both valid)
+void update_mismatch_led(void)
+{
+	long diff;
+	unsigned long ad;
+
+	if(!ref_valid || !test_valid || period_ref==0)
+	{
+		// If missing signal(s), treat as mismatch (instrument not locked)
+		MISMATCH_LED = 1;
+		mismatch = 1;
+		return;
+	}
+
+	diff = (long)period_test - (long)period_ref;
+	ad   = (diff<0)? (unsigned long)(-diff) : (unsigned long)diff;
+
+	// ON threshold ~0.25%, OFF threshold ~0.13%
+	if(!mismatch)
+	{
+		if(ad*400UL > period_ref) mismatch = 1;
+	}
+	else
+	{
+		if(ad*770UL < period_ref) mismatch = 0;
+	}
+
+	MISMATCH_LED = mismatch;
 }
 
 // ===================== MAIN =====================
 void main(void)
 {
+	unsigned long t_last_lcd;
+	unsigned long tnow;
 	unsigned char i;
-	bit st;
-
-	TIMER0_Init();
 
 	// LED push-pull
 	SFRPAGE=0x20;
@@ -427,11 +587,26 @@ void main(void)
 	MISMATCH_LED = 0;
 
 	// ADC pins
-	InitPinADC(2,5); // P2.5
-	InitPinADC(2,6); // P2.6
+	InitPinADC(2,5);
+	InitPinADC(2,6);
 	InitADC();
 
 	LCD_init();
+
+	// Timer0 free-running timebase
+	TIMER0_Init_FreeRun();
+
+	// init edge states
+	ref_prev_state = REF_SQ;
+	test_prev_state = TEST_SQ;
+
+	ref_valid = 0;
+	test_valid = 0;
+	ref_sample_pending = 0;
+	test_sample_pending = 0;
+
+	// LCD refresh timer
+	t_last_lcd = time_now_ticks();
 
 	while(1)
 	{
@@ -439,158 +614,83 @@ void main(void)
 		if((MODE_BTN==0) && (last_btn==1)) mode=(mode+1)&0x03;
 		last_btn = MODE_BTN;
 
-		// Measure both periods (edge-safe)
-		period_ref  = measure_period(REF_SQ);
-		period_test = measure_period(TEST_SQ);
+		// Update edge timestamps and scheduled sampling
+		update_edges_and_schedule();
+		update_rms_samples();
+		update_phase();
+		update_mismatch_led();
 
-		// Mismatch LED with hysteresis (ratio-based, no divide)
+		// Compute gain/dB when possible
+		if(ref_rms_mV>0)
 		{
-			long diff;
-			unsigned long ad;
-
-			diff = (long)period_test - (long)period_ref;
-			ad   = (diff<0)? (unsigned long)(-diff) : (unsigned long)diff;
-
-			// ON threshold ~0.25%, OFF threshold ~0.13%
-			if(!mismatch)
-			{
-				if(ad*400UL > period_ref) mismatch = 1;
-			}
-			else
-			{
-				if(ad*770UL < period_ref) mismatch = 0;
-			}
-			MISMATCH_LED = mismatch;
-		}
-
-		amp_ticks = period_ref/4;
-
-		// ---------- REF RMS sample at quarter-period after REF rising edge ----------
-		while(REF_SQ==1);
-		while(REF_SQ==0);
-
-		TL0=0; TH0=0; TF0=0; overflow_count=0;
-		TR0=1;
-		while((((unsigned long)overflow_count<<16)|((unsigned long)TH0<<8)|TL0) < amp_ticks)
-			if(TF0){ TF0=0; overflow_count++; }
-		TR0=0;
-
-		ref_amp_mV = mV_read(QFP32_MUX_P2_6);
-		ref_rms_mV = (unsigned int)(((unsigned long)ref_amp_mV*RMS_NUM)/RMS_DEN);
-
-		// ---------- TEST RMS sample at quarter-period after TEST rising edge ----------
-		while(TEST_SQ==1);
-		while(TEST_SQ==0);
-
-		TL0=0; TH0=0; TF0=0; overflow_count=0;
-		TR0=1;
-		while((((unsigned long)overflow_count<<16)|((unsigned long)TH0<<8)|TL0) < amp_ticks)
-			if(TF0){ TF0=0; overflow_count++; }
-		TR0=0;
-
-		test_amp_mV = mV_read(QFP32_MUX_P2_5);
-		test_rms_mV = (unsigned int)(((unsigned long)test_amp_mV*RMS_NUM)/RMS_DEN);
-
-		// ---------- Phase (edge-safe) ----------
-		while(REF_SQ==1);
-		while(REF_SQ==0);  // reference rising edge reached
-
-		st = TEST_SQ;
-
-		TL0=0; TH0=0; TF0=0; overflow_count=0;
-		TR0=1;
-
-		if(st==0)
-		{
-			// test lags: wait until it rises
-			while(TEST_SQ==0) if(TF0){ TF0=0; overflow_count++; }
-			TR0=0;
-
-			dticks = ((unsigned long)overflow_count<<16)|((unsigned long)TH0<<8)|TL0;
-			phase_cdeg = -phase_calc(dticks, period_ref);
+			gain_x10000  = ((unsigned long)test_rms_mV*10000UL)/ref_rms_mV;
+			ratio_q16_16 = ((unsigned long)test_rms_mV<<16)/ref_rms_mV;
+			db_centi     = db_centi_from_ratio_q16_16(ratio_q16_16);
 		}
 		else
 		{
-			// test leads: wait through falling then next rising
-			while(TEST_SQ==1) if(TF0){ TF0=0; overflow_count++; }
-			while(TEST_SQ==0) if(TF0){ TF0=0; overflow_count++; }
-			TR0=0;
-
-			dticks = ((unsigned long)overflow_count<<16)|((unsigned long)TH0<<8)|TL0;
-			dticks = period_ref - dticks;
-			phase_cdeg = phase_calc(dticks, period_ref);
+			gain_x10000 = 0;
+			db_centi = 0;
 		}
 
-		phase_cdeg = wrap_phase(phase_cdeg);
+		// Compute power when possible
+		// (Uses current ref_rms_mV/test_rms_mV + phase_cdeg)
+		VI_mW = ((long)ref_rms_mV * (long)test_rms_mV) / 1000L;
 
-		// ---------- Display ----------
-		clear_line(line1);
-		clear_line(line2);
+		phi_rad_q15 = phase_to_rad_q15(phase_cdeg);
+		sinphi_q15  = phi_rad_q15;
+		phi2_q15    = (phi_rad_q15 * phi_rad_q15) >> 15;
+		cosphi_q15  = 32768L - (phi2_q15 >> 1);
 
-		if(mode==0)
+		real_power_mW     = (VI_mW * cosphi_q15) >> 15;
+		reactive_power_mW = (VI_mW * sinphi_q15) >> 15;
+
+		// LCD refresh at ~5–10 Hz independent of signal presence
+		tnow = time_now_ticks();
+		if((unsigned long)(tnow - t_last_lcd) > (T0_TICKS_PER_SEC/10UL)) // ~100 ms
 		{
-			// Line1: V=?.?? I=?.??
-			put_str(line1,0,"V=");
-			put_mV(line1,2,ref_rms_mV);
-			put_str(line1,7,"I=");
-			put_mV(line1,9,test_rms_mV);
+			t_last_lcd = tnow;
 
-			// Line2: Ph=+ddd.dd
-			put_str(line2,0,"Ph=");
-			put_centi_signed(line2,3,phase_cdeg);
-		}
-		else if(mode==1)
-		{
-			// Gain + dB
-			if(ref_rms_mV>0)
+			clear_line(line1);
+			clear_line(line2);
+
+			if(mode==0)
 			{
-				gain_x10000 = ((unsigned long)test_rms_mV*10000UL)/ref_rms_mV;
-				ratio_q16_16 = ((unsigned long)test_rms_mV<<16)/ref_rms_mV;
-				db_centi = db_centi_from_ratio_q16_16(ratio_q16_16);
+				put_str(line1,0,"V=");
+				put_mV(line1,2,ref_rms_mV);
+				put_str(line1,7,"I=");
+				put_mV(line1,9,test_rms_mV);
+
+				put_str(line2,0,"Ph=");
+				put_centi_signed(line2,3,phase_cdeg);
+			}
+			else if(mode==1)
+			{
+				put_str(line1,0,"G=");
+				put_gain(line1,2,gain_x10000);
+
+				put_str(line2,0,"dB=");
+				put_db(line2,3,db_centi);
+			}
+			else if(mode==2)
+			{
+				// Display as centi-W: 0.01W = 10mW => centiW = mW/10
+				put_str(line1,0,"P=");
+				put_centi_signed(line1,2,(real_power_mW/10L));
+				put_str(line2,0,"Q=");
+				put_centi_signed(line2,2,(reactive_power_mW/10L));
 			}
 			else
 			{
-				gain_x10000 = 0;
-				db_centi = 0;
+				put_str(line1,0,"MODE 3");
+				put_str(line2,0,"(unused)");
 			}
 
-			put_str(line1,0,"G=");
-			put_gain(line1,2,gain_x10000);
-
-			put_str(line2,0,"dB=");
-			put_db(line2,3,db_centi);
-		}
-		else if(mode==2)
-		{
-			// Power P and Q
-			VI_mW = ((long)ref_rms_mV * (long)test_rms_mV) / 1000L;
-
-			phi_rad_q15 = phase_to_rad_q15(phase_cdeg);
-
-			sinphi_q15 = phi_rad_q15;
-			phi2_q15 = (phi_rad_q15 * phi_rad_q15) >> 15;
-			cosphi_q15 = 32768L - (phi2_q15 >> 1);
-
-			real_power_mW = (VI_mW * cosphi_q15) >> 15;
-			reactive_power_mW = (VI_mW * sinphi_q15) >> 15;
-
-			// Display as centi-W: 0.01W = 10mW => centiW = mW/10
-			put_str(line1,0,"P=");
-			put_centi_signed(line1,2,(real_power_mW/10L));
-
-			put_str(line2,0,"Q=");
-			put_centi_signed(line2,2,(reactive_power_mW/10L));
-		}
-		else
-		{
-			put_str(line1,0,"MODE 3");
-			put_str(line2,0,"(unused)");
+			LCDprint(line1,1);
+			LCDprint(line2,2);
 		}
 
-		LCDprint(line1,1);
-		LCDprint(line2,2);
-
-		// modest update rate (reduces flicker)
-		for(i=0;i<5;i++) waitms(20);
+		// short idle to reduce LCD/ADC hammering (non-blocking measurement still works)
+		for(i=0;i<2;i++) Timer3us(200);
 	}
 }
